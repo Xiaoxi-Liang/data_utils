@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -40,7 +41,10 @@ except ImportError:
     SCIPY_AVAILABLE = False
     print("[warning] scipy not available. Will use simple downsampling instead of interpolation.")
 
-import lerobot.common.datasets.lerobot_dataset as lerobot_dataset_module
+try:
+    import lerobot.common.datasets.lerobot_dataset as lerobot_dataset_module
+except ImportError:
+    lerobot_dataset_module = None
 
 # Try to import rosbag2_py (preferred method)
 try:
@@ -115,12 +119,15 @@ def _video_pointer_struct():
 def configure_lerobot_home(output_dir: Path | None) -> Path:
     """Configure LeRobot home directory."""
     if output_dir is None:
-        return Path(lerobot_dataset_module.HF_LEROBOT_HOME)
+        if lerobot_dataset_module is not None:
+            return Path(lerobot_dataset_module.HF_LEROBOT_HOME)
+        return Path(os.environ.get("HF_LEROBOT_HOME", "./lerobot_data_disk1")).expanduser().resolve()
 
     resolved = output_dir.expanduser().resolve()
     resolved.mkdir(parents=True, exist_ok=True)
     os.environ["HF_LEROBOT_HOME"] = str(resolved)
-    lerobot_dataset_module.HF_LEROBOT_HOME = resolved
+    if lerobot_dataset_module is not None:
+        lerobot_dataset_module.HF_LEROBOT_HOME = resolved
     return resolved
 
 
@@ -350,19 +357,26 @@ def update_chunk_episode_json(
     chunk_key = chunk_rel_dir.as_posix()
     stats_dir = dataset_root / "stats"
     stats_dir.mkdir(parents=True, exist_ok=True)
-
-    if chunk_key not in chunk_json_cache:
-        chunk_json_cache[chunk_key] = {
+    existing = chunk_json_cache.get(chunk_key)
+    if existing is None:
+        new_payload = {
             "chunk": chunk_rel_dir.name,
             "chunk_path": chunk_key,
-            "episodes": [],
+            "episodes": [episode_record],
         }
-
-    chunk_json_cache[chunk_key]["episodes"].append(episode_record)
-
+    else:
+        # Build a new payload first so failures won't partially mutate cache.
+        new_payload = {
+            "chunk": existing["chunk"],
+            "chunk_path": existing["chunk_path"],
+            "episodes": [*existing["episodes"], episode_record],
+        }
     json_path = stats_dir / f"{chunk_rel_dir.name}_episodes_state_action.json"
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(chunk_json_cache[chunk_key], f, ensure_ascii=False, indent=2)
+    tmp_path = json_path.with_suffix(json_path.suffix + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(new_payload, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, json_path)
+    chunk_json_cache[chunk_key] = new_payload
     return chunk_key, json_path
 
 
@@ -918,7 +932,8 @@ def oss_mv_and_del_file(local_path: Path, oss_target_path: str) -> None:
         local_path: 本地文件路径
         oss_target_path: OSS 目标路径
     """
-    command = f'ossutil cp "{local_path}" "{normalize_oss_path(oss_target_path)}" --update'
+    normalized_target = normalize_oss_path(oss_target_path)
+    command = f'ossutil cp "{local_path}" "{normalized_target}" --update'
     if run_with_retry(command):
         safe_delete(local_path)
     else:
@@ -933,6 +948,15 @@ def oss_rm_path(oss_path: str) -> None:
         os.system(command)
     except Exception as exc:
         print(f"[warn] Failed to rm OSS path {oss_path}: {exc}")
+
+
+def oss_rm_prefix(oss_prefix: str) -> None:
+    """Best-effort recursive remove for OSS prefixes/directories."""
+    try:
+        command = f'ossutil rm "{normalize_oss_path(oss_prefix)}" -r -f'
+        os.system(command)
+    except Exception as exc:
+        print(f"[warn] Failed to rm OSS prefix {oss_prefix}: {exc}")
 
 
 def append_jsonl(path: Path, record: dict) -> None:
@@ -1050,6 +1074,19 @@ def convert_mcap_to_lerobot(
         oss_dataset_root = join_oss_path(oss_output_dir, Path(repo_id))
         print(f"[info] OSS upload enabled. Target: {oss_dataset_root}")
 
+    def rollback_chunk_oss_payload(chunk_name: str) -> list[str]:
+        """Delete uploaded data/video payload for one chunk on OSS."""
+        if oss_dataset_root is None:
+            return []
+        deleted_prefixes: list[str] = []
+        data_prefix = join_oss_path(oss_dataset_root, Path("data") / chunk_name)
+        videos_prefix = join_oss_path(oss_dataset_root, Path("videos") / chunk_name)
+        stats_file = join_oss_path(oss_dataset_root, Path("stats") / f"{chunk_name}_episodes_state_action.json")
+        for p in (data_prefix, videos_prefix, stats_file):
+            oss_rm_prefix(p) if p.endswith(chunk_name) else oss_rm_path(p)
+            deleted_prefixes.append(p)
+        return deleted_prefixes
+
     meta_dir = dataset_root / "meta"
     episodes_path = meta_dir / "episodes.jsonl"
     tasks_path = meta_dir / "tasks.jsonl"
@@ -1081,6 +1118,8 @@ def convert_mcap_to_lerobot(
     # Rollback deletion audit (OSS). We will also write per-event jsonl immediately.
     rollback_events: list[dict] = []
     rollback_log_path = meta_dir / "rollback_deletions.jsonl"
+    failed_episodes: list[dict] = []
+    failed_episodes_log_path = meta_dir / "failed_episodes.jsonl"
     
     # Track chunk changes for OSS upload
     last_chunk_key: str | None = None
@@ -1095,6 +1134,7 @@ def convert_mcap_to_lerobot(
         try:
             # Track uploaded OSS objects for this episode so we can roll back on failure.
             uploaded_oss_paths: list[str] = []
+            created_local_paths: list[Path] = []
 
             # Extract data from MCAP
             if ROSBAG2_AVAILABLE:
@@ -1151,6 +1191,7 @@ def convert_mcap_to_lerobot(
             episode_index = converted
             chunk_idx = episode_index // CHUNK_SIZE
             chunk_name = f"chunk-{chunk_idx:03d}"
+            current_chunk_key = (Path("data") / chunk_name).as_posix()
             
             # Create videos for all cameras (and upload)
             video_rel_paths: dict[str, str] = {}
@@ -1161,21 +1202,24 @@ def convert_mcap_to_lerobot(
                 video_rel_path = f"videos/{chunk_name}/observation.images.{cam_name}/episode_{episode_index:06d}.mp4"
                 video_target = dataset_root / video_rel_path
                 create_video_from_images(cam_images, video_target, fps=fps)
+                created_local_paths.append(video_target)
                 video_rel_paths[cam_name] = video_rel_path
+
+                if probed_video_info is None and video_target.exists():
+                    probed_video_info = probe_video_codec_info(video_target)
 
                 # Upload video immediately to OSS if enabled, then delete local file
                 if oss_dataset_root is not None and video_target.exists():
                     oss_target_path = join_oss_path(oss_dataset_root, video_rel_path)
                     oss_mv_and_del_file(video_target, oss_target_path)
                     uploaded_oss_paths.append(oss_target_path)
-                
-                if probed_video_info is None and video_target.exists():
-                    probed_video_info = probe_video_codec_info(video_target)
-            
-            if task not in task_to_index:
-                task_to_index[task] = len(task_to_index)
-                task_order.append(task)
-            task_idx = task_to_index[task]
+
+            # Use a provisional task index; commit to task map only after episode succeeds.
+            is_new_task = task not in task_to_index
+            if is_new_task:
+                task_idx = len(task_to_index)
+            else:
+                task_idx = task_to_index[task]
             
             # Create frames (state-action pairs)
             frames = [
@@ -1194,6 +1238,7 @@ def convert_mcap_to_lerobot(
                 index_offset=total_frames,
                 task_index=task_idx,
             )
+            created_local_paths.append(episode_parquet_path)
             
             # Upload parquet file to OSS if enabled
             if oss_dataset_root is not None:
@@ -1203,16 +1248,6 @@ def convert_mcap_to_lerobot(
                 uploaded_oss_paths.append(oss_target_path)
             
             num_frames = len(frames)
-            # ---- Commit episode metadata ONLY after we know video+parquet are successfully produced/uploaded ----
-            episodes_lines.append(
-                {
-                    "episode_chunk": chunk_idx,
-                    "episode_index": episode_index,
-                    "tasks": [json.dumps({"task": task}, ensure_ascii=False)],
-                    "length": num_frames,
-                }
-            )
-
             stats_minimal = _compute_episode_stats_minimal(
                 frames,
                 episode_index=episode_index,
@@ -1220,12 +1255,22 @@ def convert_mcap_to_lerobot(
                 task_index=task_idx,
                 fps=fps,
             )
-            stats_lines.append({"episode_chunk": chunk_idx, "episode_index": episode_index, "stats": stats_minimal})
 
-            # Record alignment stats only for successful episodes
-            all_episode_alignment_stats.append(episode_alignment_record)
+            # Upload previous chunk's JSON first (if we are switching chunks).
+            # Do this before current episode metadata commit to keep per-episode commit atomic.
+            if (
+                oss_dataset_root is not None
+                and last_chunk_key is not None
+                and last_chunk_key != current_chunk_key
+                and last_chunk_json_path is not None
+                and last_chunk_json_path.exists()
+            ):
+                json_rel_path = last_chunk_json_path.relative_to(dataset_root)
+                oss_target_path = join_oss_path(oss_dataset_root, json_rel_path)
+                oss_mv_and_del_file(last_chunk_json_path, oss_target_path)
+                uploaded_oss_paths.append(oss_target_path)
 
-            # Update per-chunk episode JSON only for successful episodes
+            # ---- Commit episode metadata atomically after all failure-prone steps above ----
             episode_parquet_rel_path = Path("data") / chunk_name / f"episode_{episode_index:06d}.parquet"
             current_chunk_key, current_chunk_json_path = update_chunk_episode_json(
                 dataset_root=dataset_root,
@@ -1243,21 +1288,21 @@ def convert_mcap_to_lerobot(
                 },
                 chunk_json_cache=chunk_json_cache,
             )
-
-            # Upload chunk JSON file to OSS if enabled (only when chunk changes)
-            if oss_dataset_root is not None:
-                if (last_chunk_key is not None and 
-                    last_chunk_key != current_chunk_key and
-                    last_chunk_json_path is not None and
-                    last_chunk_json_path.exists()):
-                    # Upload previous chunk's JSON file
-                    json_rel_path = last_chunk_json_path.relative_to(dataset_root)
-                    oss_target_path = join_oss_path(oss_dataset_root, json_rel_path)
-                    oss_mv_and_del_file(last_chunk_json_path, oss_target_path)
-                    uploaded_oss_paths.append(oss_target_path)
-                
-                last_chunk_key = current_chunk_key
-                last_chunk_json_path = current_chunk_json_path
+            if is_new_task:
+                task_to_index[task] = task_idx
+                task_order.append(task)
+            episodes_lines.append(
+                {
+                    "episode_chunk": chunk_idx,
+                    "episode_index": episode_index,
+                    "tasks": [json.dumps({"task": task}, ensure_ascii=False)],
+                    "length": num_frames,
+                }
+            )
+            stats_lines.append({"episode_chunk": chunk_idx, "episode_index": episode_index, "stats": stats_minimal})
+            all_episode_alignment_stats.append(episode_alignment_record)
+            last_chunk_key = current_chunk_key
+            last_chunk_json_path = current_chunk_json_path
             
             total_frames += num_frames
             converted += 1
@@ -1282,10 +1327,20 @@ def convert_mcap_to_lerobot(
                 }
                 rollback_events.append(evt)
                 append_jsonl(rollback_log_path, evt)
+            # Remove local artifacts created by this failed episode in local-output mode.
+            for local_path in created_local_paths:
+                safe_delete(local_path)
+            fail_record = {
+                "episode_name": episode_name,
+                "source_episode_index": ep_idx,
+                "mcap_path": str(mcap_path),
+                "reason_type": type(exc).__name__,
+                "reason": str(exc),
+            }
+            failed_episodes.append(fail_record)
+            append_jsonl(failed_episodes_log_path, fail_record)
             skipped += 1
             print(f"[warn] skip episode={episode_name}, reason={type(exc).__name__}: {exc}")
-            import traceback
-            traceback.print_exc()
     
     # Ensure meta directory exists before writing files
     meta_dir.mkdir(parents=True, exist_ok=True)
@@ -1361,24 +1416,94 @@ def convert_mcap_to_lerobot(
             json.dump(summary, f, ensure_ascii=False, indent=2)
         print(f"[info] Rollback deletion log saved to: {rollback_log_path}")
         print(f"[info] Rollback deletion summary saved to: {summary_path}")
+
+    if failed_episodes:
+        failed_summary_path = meta_dir / "failed_episodes_summary.json"
+        failed_summary = {
+            "total_failed_episodes": len(failed_episodes),
+            "failed_episodes": failed_episodes,
+        }
+        with open(failed_summary_path, "w", encoding="utf-8") as f:
+            json.dump(failed_summary, f, ensure_ascii=False, indent=2)
+        print(f"[info] Failed episodes log saved to: {failed_episodes_log_path}")
+        print(f"[info] Failed episodes summary saved to: {failed_summary_path}")
     
     # Upload remaining chunk JSON file if OSS is enabled
     if oss_dataset_root is not None:
+        upload_failures: list[dict] = []
+        had_chunk_consistency_failure = False
         if last_chunk_json_path is not None and last_chunk_json_path.exists():
-            json_rel_path = last_chunk_json_path.relative_to(dataset_root)
-            oss_target_path = join_oss_path(oss_dataset_root, json_rel_path)
-            oss_mv_and_del_file(last_chunk_json_path, oss_target_path)
+            try:
+                json_rel_path = last_chunk_json_path.relative_to(dataset_root)
+                oss_target_path = join_oss_path(oss_dataset_root, json_rel_path)
+                oss_mv_and_del_file(last_chunk_json_path, oss_target_path)
+            except Exception as exc:
+                chunk_name = last_chunk_json_path.name.replace("_episodes_state_action.json", "")
+                deleted_prefixes = rollback_chunk_oss_payload(chunk_name)
+                had_chunk_consistency_failure = True
+                upload_failures.append(
+                    {
+                        "stage": "upload_last_chunk_json",
+                        "local_path": str(last_chunk_json_path),
+                        "reason_type": type(exc).__name__,
+                        "reason": str(exc),
+                        "rolled_back_prefixes": deleted_prefixes,
+                    }
+                )
+                print(f"[warn] failed upload of last chunk json: {exc}")
         
         # Upload all remaining directories (meta, data, stats, videos)
         print(f"[info] Uploading remaining files to OSS...")
-        upload_dir_files_to_oss_and_delete(meta_dir, oss_dataset_root, dataset_root)
-        upload_dir_files_to_oss_and_delete(dataset_root / "data", oss_dataset_root, dataset_root)
-        upload_dir_files_to_oss_and_delete(dataset_root / "stats", oss_dataset_root, dataset_root)
+        for subdir in (dataset_root / "data", dataset_root / "stats"):
+            try:
+                upload_dir_files_to_oss_and_delete(subdir, oss_dataset_root, dataset_root)
+            except Exception as exc:
+                failure_item = {
+                    "stage": "upload_dir_files_to_oss_and_delete",
+                    "local_path": str(subdir),
+                    "reason_type": type(exc).__name__,
+                    "reason": str(exc),
+                }
+                # If stats upload fails for a chunk json, roll back corresponding chunk payload.
+                if subdir.name == "stats":
+                    m = re.search(r"(chunk-\d+)_episodes_state_action\.json", str(exc))
+                    if m:
+                        failed_chunk = m.group(1)
+                        deleted_prefixes = rollback_chunk_oss_payload(failed_chunk)
+                        failure_item["rolled_back_prefixes"] = deleted_prefixes
+                        had_chunk_consistency_failure = True
+                upload_failures.append(
+                    failure_item
+                )
+                print(f"[warn] failed upload of directory {subdir}: {exc}")
         # Videos are uploaded per-episode immediately after creation above.
-        
-        # Clean up local directory
+
+        # Upload meta only when chunk-level consistency is preserved.
+        if not had_chunk_consistency_failure:
+            try:
+                upload_dir_files_to_oss_and_delete(meta_dir, oss_dataset_root, dataset_root)
+            except Exception as exc:
+                upload_failures.append(
+                    {
+                        "stage": "upload_dir_files_to_oss_and_delete",
+                        "local_path": str(meta_dir),
+                        "reason_type": type(exc).__name__,
+                        "reason": str(exc),
+                    }
+                )
+                print(f"[warn] failed upload of directory {meta_dir}: {exc}")
+        else:
+            print("[warn] skipped meta upload due to chunk consistency failure")
+
+        if upload_failures:
+            upload_failed_log_path = meta_dir / "upload_failures_summary.json"
+            with open(upload_failed_log_path, "w", encoding="utf-8") as f:
+                json.dump({"failures": upload_failures}, f, ensure_ascii=False, indent=2)
+            print(f"[warn] Some final uploads failed")
+            print(f"[warn] Upload failure summary saved to: {upload_failed_log_path}")
+        # User requirement: always remove local dataset after finishing OSS flow.
         shutil.rmtree(dataset_root, ignore_errors=True)
-        print(f"[info] Uploaded dataset to {oss_dataset_root} and removed local directory")
+        print(f"[info] Finalized OSS flow for {oss_dataset_root} and removed local directory")
     
     print(f"[done] converted={converted}, skipped={skipped}, total_requested={len(episode_records)}")
     
